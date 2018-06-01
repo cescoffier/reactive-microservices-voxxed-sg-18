@@ -1,6 +1,8 @@
 package me.escoffier.demo;
 
+import io.reactivex.Flowable;
 import io.reactivex.Single;
+import io.vertx.circuitbreaker.CircuitBreakerOptions;
 import io.vertx.core.json.JsonObject;
 import io.vertx.reactivex.circuitbreaker.CircuitBreaker;
 import io.vertx.reactivex.core.AbstractVerticle;
@@ -10,6 +12,7 @@ import io.vertx.reactivex.ext.web.RoutingContext;
 import io.vertx.reactivex.ext.web.client.HttpResponse;
 import io.vertx.reactivex.ext.web.client.WebClient;
 import io.vertx.reactivex.servicediscovery.ServiceDiscovery;
+import io.vertx.reactivex.servicediscovery.types.HttpEndpoint;
 
 public class MyShoppingList extends AbstractVerticle {
 
@@ -19,20 +22,36 @@ public class MyShoppingList extends AbstractVerticle {
   @Override
   public void start() {
 
+    circuit = CircuitBreaker.create("circuit-breaker", vertx,
+      new CircuitBreakerOptions()
+        .setFallbackOnFailure(true)
+        .setMaxFailures(3)
+        .setResetTimeout(5000)
+        .setTimeout(1000)
+    );
+
     Router router = Router.router(vertx);
     router.route("/health").handler(rc -> rc.response().end("OK"));
     router.route("/").handler(this::getShoppingList);
 
     ServiceDiscovery.create(vertx, discovery -> {
       // Get pricer-service
-
+      Single<WebClient> s1 = HttpEndpoint.rxGetWebClient(discovery,
+        rec -> rec.getName().equals("pricer-service"));
       // Get shopping-backend
+      Single<WebClient> s2 = HttpEndpoint.rxGetWebClient(discovery,
+        rec -> rec.getName().equals("shopping-backend"));
 
       // Assigned the field and start the HTTP server When both have been retrieved
+      Single.zip(s1, s2, (p, s) -> {
+        this.pricer = p;
+        this.shopping = s;
 
-      vertx.createHttpServer()
-        .requestHandler(router::accept)
-        .listen(8080);
+        return vertx.createHttpServer()
+          .requestHandler(router::accept)
+          .listen(8080);
+      })
+        .subscribe();
     });
 
   }
@@ -74,7 +93,20 @@ public class MyShoppingList extends AbstractVerticle {
                  |
           end <--|
          */
-
+    single.flatMapPublisher(
+      json -> Flowable.fromIterable(json)
+    )
+      .flatMapSingle(entry ->
+        circuit.rxExecuteCommandWithFallback(
+          future -> Shopping.retrievePrice(pricer,
+            entry, future),
+          err -> Shopping.getFallbackPrice(entry)
+        ))
+      .subscribe(
+        json -> Shopping.writeProductLine(serverResponse, json),
+        rc::fail,
+        serverResponse::end
+      );
 
   }
 
